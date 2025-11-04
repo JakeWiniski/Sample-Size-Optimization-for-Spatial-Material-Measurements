@@ -1,0 +1,345 @@
+---
+title: "Subsampling Stability & Sample Size Optimization for Spatial Material Measurements"
+author: "J. W."
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(readr)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ==============================================================================
+# PURPOSE
+# ------------------------------------------------------------------------------
+# Evaluate whether n = 15 samples per specimen (SpecimenID) is under- or over-
+# sampling. The analysis resamples subsets
+# of samplees (n = 1…N_MAX) WITHOUT replacement, estimates the distribution of
+# the subsample mean at each n, and determines the smallest n that achieves a
+# practical notion of "stability".
+#
+# WHAT THE CODE DOES
+# ------------------------------------------------------------------------------
+# 1) Robustly resolves column names (handles sanitized headers and past renames).
+# 2) Computes within-specimen CV% and sets data-driven stability targets:
+#       - STABILITY_PCT : allowable % deviation of subsample mean from the
+#                         full-sample (reference) mean.
+#       - CI_HALF_PCT   : allowable % 95% CI half-width (precision target),
+#                         expressed as % of the reference mean.
+#       - DEV_Q         : deviation quantile used for the stability test
+#                         (risk tolerance; e.g., 0.95 = 95th percentile).
+#    Targets are chosen from tiers based on median within-specimen CV:
+#       CV ≤ 5%   →  STABILITY_PCT = 2%,  CI_HALF_PCT = 2%,  DEV_Q = 0.95
+#       5%<CV≤10% →  STABILITY_PCT = 3%,  CI_HALF_PCT = 3%,  DEV_Q = 0.95
+#       CV > 10%  →  STABILITY_PCT = 5%,  CI_HALF_PCT = 5%,  DEV_Q = 0.90
+#    (If CV can’t be computed, defaults to 3%, 3%, 0.95.)
+#
+# 3) For each SpecimenID, builds a "stability curve" by resampling n = 1…N_MAX:
+#       - mean_est : mean of bootstrapped subsample means (for plotting).
+#       - ci_low / ci_high : 95% bootstrap CI for the subsample mean.
+#       - dev_qpct : DEV_Q-quantile of |subsample mean − reference mean|
+#                    as a % of the reference mean.
+#
+# 4) Determines per-specimen "stable n" under two criteria:
+#       - stable_n_relchange_q : smallest n where dev_qpct ≤ STABILITY_PCT.
+#       - stable_n_ciwidth     : smallest n where CI half-width ≤ CI_HALF_PCT
+#                                of the reference mean.
+#
+# KEY OUTPUTS
+# ------------------------------------------------------------------------------
+# - `stable_table` (per specimen):
+#       SpecimenID | ref_mean | stable_n_relchange_q | stable_n_ciwidth
+# - `summary_counts` (rollup for decision-making):
+#       criterion | median_stable_n | pct_specimens_met_by_n15
+# - Plots:
+#   (A) Convergence plot: mean_est vs n with 95% CI ribbon and dashed ref_mean.
+#   (B) Deviation quantile plot: dev_qpct vs n with STABILITY_PCT reference line.
+#   (C) CI half-width plot: ci_half_rel vs n with CI_HALF_PCT reference line.
+#
+# HOW TO INTERPRET
+# ------------------------------------------------------------------------------
+# 1) stable_n_relchange_q (bias control):
+#    - If most specimens achieve stable_n_relchange_q << 15, your current n = 15
+#      is likely over-sampling for controlling mean bias at DEV_Q.
+#    - If many specimens need n close to N_MAX to meet STABILITY_PCT, your n = 15
+#      may be necessary (or even low if you tighten thresholds).
+#
+# 2) stable_n_ciwidth (precision control):
+#    - This reflects the sampling needed to get a narrow 95% CI on the mean.
+#    - If stable_n_ciwidth ~ 15 for many specimens, reducing n will widen CIs
+#      beyond your target; either accept larger CI_HALF_PCT or keep n = 15+.
+#
+# 3) Tuning thresholds:
+#    - STABILITY_PCT and CI_HALF_PCT should align with the *decision context*:
+#      screening (lenient), development (moderate), release/QA (strict).
+#    - Use DEV_Q to encode risk tolerance (0.90 = lenient, 0.95 = balanced,
+#      0.975–0.99 = conservative).
+#
+# RULES OF THUMB
+# ------------------------------------------------------------------------------
+# - Biological materials often show CV = 5–15%. Requiring 1–2% CI half-width
+#   typically implies n larger than 15 unless CV is very low.
+# - If your median CV drops after process improvements (thickness control,
+#   moisture normalization, position balancing), you can revisit and tighten
+#   STABILITY_PCT / CI_HALF_PCT or reduce n.
+#
+# DIAGNOSTICS & EDGE CASES
+# ------------------------------------------------------------------------------
+# - Specimens with <2 valid samplees are excluded from CV calculation.
+# - Non-positive or missing means are filtered out for CV computation.
+# - If column names change, the resolver will try fuzzy matching; otherwise it
+#   fails fast with a helpful error listing available columns.
+#
+# PERFORMANCE TIPS
+# ------------------------------------------------------------------------------
+# - Set N_BOOT ~ 300–500 for faster, exploratory runs; 1000–2000 for tighter CIs.
+# - If many specimens exist, consider running on a subset first, or parallelize
+#   replicate generation if available in your environment.
+#
+# DECISION GUIDANCE
+# ------------------------------------------------------------------------------
+# - Over-sampling signal: median(stable_n_relchange_q) and median(stable_n_ciwidth)
+#   both well below 15 → consider reducing n.
+# - Borderline sufficiency: one criterion << 15 but the other ~ 15 → decide which
+#   risk you care more about (bias vs precision) and set n accordingly.
+# - Under-sampling: both criteria ≈ 15 or > N_MAX → increase n or relax targets
+#   (or reduce process noise) to meet decision-quality requirements.
+# ==============================================================================
+
+# Decomposition Analysis #
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ---- Parameters & data-driven targets (robust to sanitized column names) ----
+N_BOOT  <- 1000
+N_MAX   <- 15
+FEATURE <- "density" #define feature (synthetic dataset)
+ID_COL  <- "specimen_id" #define specimen ID (synthetic dataset)
+DATA_PATH <- "synthetic_sheet_sampling_20x15.csv" # path to synthetic data
+set.seed(123)
+
+# Load data (use existing `dat` if present; otherwise read from CSV)
+if (!exists("dat")) {
+  # prefer unsanitized names; fall back to default if needed
+  dat <- tryCatch(
+    read.csv(DATA_PATH, check.names = FALSE),
+    error = function(e) read.csv(DATA_PATH, check.names = TRUE)
+  )
+}
+
+# --- Helper to find a column ignoring punctuation/case -----------------------
+canon <- function(x) tolower(gsub("[^a-z0-9]", "", x))
+find_col <- function(df, target_label) {
+  cn  <- names(df)
+  ccn <- canon(cn)
+  tgt <- canon(target_label)
+  hit <- which(ccn == tgt)
+  if (length(hit) == 1) return(cn[hit])
+  # try partial match if exact canonical not found
+  hit <- grep(tgt, ccn, fixed = TRUE)
+  if (length(hit) == 1) return(cn[hit])
+  stop(sprintf(
+    "Could not locate column '%s'. Available columns:\n  %s",
+    target_label, paste(cn, collapse = ", ")
+  ))
+}
+
+# Resolve actual column names in `dat`
+feature_col <- find_col(dat, FEATURE)
+id_col      <- find_col(dat, ID_COL)
+
+# Coerce numeric feature and rename ID column to SpecimenID
+dat[[feature_col]] <- suppressWarnings(as.numeric(dat[[feature_col]]))
+names(dat)[names(dat) == id_col] <- "SpecimenID"
+
+# Compute within-specimen CV (%) using available replicates
+suppressPackageStartupMessages(library(dplyr))
+cv_specimen <- dat %>%
+  group_by(SpecimenID) %>%
+  summarize(
+    mean_val = mean(.data[[feature_col]], na.rm = TRUE),
+    sd_val   = sd(.data[[feature_col]],   na.rm = TRUE),
+    n_non_na = sum(!is.na(.data[[feature_col]])),
+    .groups  = "drop"
+  ) %>%
+  filter(n_non_na >= 2, is.finite(mean_val), mean_val > 0) %>%
+  mutate(cv_pct = 100 * sd_val / mean_val)
+
+med_cv <- median(cv_specimen$cv_pct, na.rm = TRUE)
+
+# Set targets based on observed variability (practical tiers)
+if (is.na(med_cv)) {
+  STABILITY_PCT <- 3; CI_HALF_PCT <- 3; DEV_Q <- 0.95
+} else if (med_cv <= 5) {
+  STABILITY_PCT <- 2; CI_HALF_PCT <- 2; DEV_Q <- 0.95
+} else if (med_cv <= 10) {
+  STABILITY_PCT <- 3; CI_HALF_PCT <- 3; DEV_Q <- 0.95
+} else {
+  STABILITY_PCT <- 5; CI_HALF_PCT <- 5; DEV_Q <- 0.90
+}
+
+message(sprintf(
+  "Median within-specimen CV = %.2f%%  ->  STABILITY_PCT = %s%%, CI_HALF_PCT = %s%%, DEV_Q = %.3f\n(feature_col = '%s', id_col mapped to 'SpecimenID')",
+  med_cv, STABILITY_PCT, CI_HALF_PCT, DEV_Q, feature_col
+))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# ---- Load & clean (same spirit as before) -----------------------------------
+raw <- read.csv(DATA_PATH, check.names = FALSE)
+
+# -- Compatibility shim for synthetic dataset --------------------------
+if (!"Sample_ID" %in% names(raw)) raw$Sample_ID <- raw[[ID_COL]]
+if (!"Rep" %in% names(raw) && "position_id" %in% names(raw)) raw$Rep <- raw$position_id
+
+
+dat <- raw %>%
+  dplyr::select(Sample_ID, all_of(ID_COL), Rep, all_of(FEATURE)) %>%
+  dplyr::mutate(
+    Rep = suppressWarnings(as.integer(Rep)),
+    `{FEATURE}` := suppressWarnings(as.numeric(.data[[FEATURE]]))
+  ) %>%
+  dplyr::rename(DryMass = !!FEATURE, SpecimenID = !!ID_COL) %>%
+  dplyr::filter(!is.na(DryMass))
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ---- Resampling function with deviation quantile ----------------------------
+# For each n, we draw many subsamples WITHOUT replacement, compute their means,
+# then summarize:
+#   - mean_est (for visualization)
+#   - 95% bootstrap CI
+#   - dev_qpct: the DEV_Q quantile of |mean - ref_mean| / ref_mean * 100
+stability_curve_one <- function(x, ref_mean, n_max = N_MAX, n_boot = N_BOOT, dev_q = DEV_Q) {
+  n_max_specimen <- min(length(x), n_max)
+  ns <- 1:n_max_specimen
+
+  purrr::map_dfr(ns, function(i) {
+    boot_means <- replicate(n_boot, mean(sample(x, size = i, replace = FALSE)))
+    dev_abs_pct <- abs(boot_means - ref_mean) / ref_mean * 100
+
+    tibble::tibble(
+      n        = i,
+      mean_est = mean(boot_means),
+      ci_low   = stats::quantile(boot_means, 0.025, names = FALSE),
+      ci_high  = stats::quantile(boot_means, 0.975, names = FALSE),
+      dev_qpct = stats::quantile(dev_abs_pct, dev_q, names = FALSE)
+    )
+  })
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ---- Build curves for every specimen -------------------------------------------
+stab <- dat %>%
+  dplyr::group_by(SpecimenID) %>%
+  dplyr::summarise(ref_mean = mean(DryMass), vals = list(DryMass), .groups = "drop") %>%
+  dplyr::mutate(curve = purrr::map2(vals, ref_mean,
+                                    ~ stability_curve_one(.x, ref_mean = .y,
+                                                         n_max = N_MAX, n_boot = N_BOOT, dev_q = DEV_Q))) %>%
+  dplyr::select(-vals) %>%
+  tidyr::unnest(curve) %>%
+  dplyr::mutate(
+    ci_halfwidth = (ci_high - ci_low) / 2,
+    ci_half_rel  = ci_halfwidth / ref_mean * 100
+  )
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ---- Determine stable n under two criteria ----------------------------------
+# 1) Deviation quantile criterion: dev_qpct <= STABILITY_PCT
+# 2) CI half-width criterion:      ci_half_rel <= CI_HALF_PCT
+stable_table <- stab %>%
+  dplyr::group_by(SpecimenID, ref_mean) %>%
+  dplyr::summarise(
+    stable_n_relchange_q = {
+      idx <- which(dev_qpct <= STABILITY_PCT)
+      if (length(idx)) min(n[idx]) else NA_integer_
+    },
+    stable_n_ciwidth = {
+      idx <- which(ci_half_rel <= CI_HALF_PCT)
+      if (length(idx)) min(n[idx]) else NA_integer_
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(SpecimenID)
+
+stable_table
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ---- Quick rollup for decision-making ---------------------------------------
+summary_counts <- tibble::tibble(
+  criterion = c(paste0(DEV_Q*100, "th pct abs deviation ≤ ", STABILITY_PCT, "%"),
+                paste0("CI half-width ≤ ", CI_HALF_PCT, "%")),
+  median_stable_n = c(stats::median(stable_table$stable_n_relchange_q, na.rm = TRUE),
+                      stats::median(stable_table$stable_n_ciwidth,     na.rm = TRUE)),
+  pct_specimens_met_by_n15 = c(
+    mean(stable_table$stable_n_relchange_q <= 15, na.rm = TRUE) * 100,
+    mean(stable_table$stable_n_ciwidth     <= 15, na.rm = TRUE) * 100
+  )
+)
+
+summary_counts
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Convergence of mean with 95% CI (same idea as before)
+ggplot2::ggplot(stab, ggplot2::aes(x = n, y = mean_est)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high), alpha = 0.15) +
+  ggplot2::geom_line(size = 0.7) +
+  ggplot2::geom_hline(ggplot2::aes(yintercept = ref_mean), linetype = "dashed") +
+  ggplot2::facet_wrap(~ SpecimenID, scales = "free_y") +
+  ggplot2::labs(
+    title = "Convergence of Mean Sample Dry Mass (g) vs. Sampling Depth (n)",
+    subtitle = "Ribbon = 95% bootstrap CI of subsample means; dashed = full-sample specimen mean",
+    x = "Sample size (n)", y = "Mean estimate (g)"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# NEW: Deviation quantile vs n (the driver of stable_n_relchange_q)
+ggplot2::ggplot(stab, ggplot2::aes(x = n, y = dev_qpct, group = SpecimenID, color = SpecimenID)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(size = 1) +
+  ggplot2::geom_hline(yintercept = STABILITY_PCT, linetype = "dotted") +
+  ggplot2::labs(
+    title = paste0(round(DEV_Q*100), "th Percentile Absolute Deviation from Ref. Mean"),
+    subtitle = paste0("Stability when deviation ≤ ", STABILITY_PCT, "%"),
+    x = "Sample size (n)", y = "Deviation (%)"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# CI half-width vs n (as % of ref mean) stays the same
+ggplot2::ggplot(stab, ggplot2::aes(x = n, y = ci_half_rel, group = SpecimenID, color = SpecimenID)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(size = 1) +
+  ggplot2::geom_hline(yintercept = CI_HALF_PCT, linetype = "dotted") +
+  ggplot2::labs(
+    title = "95% CI Half-Width of Subsample Mean vs n",
+    subtitle = paste0("Stability when CI half-width ≤ ", CI_HALF_PCT, "% of ref mean"),
+    x = "Sample size (n)", y = "Percent of ref mean"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none")
+```
+
+
+
