@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this workflow or software, please cite it using the metadata below."
+title: "Subsampling Stability & Sample Size Optimization for Spatial Material Measurements"
+authors:
+  - family-names: "Winiski"
+    given-names: "Jake"
+doi: 10.5281/zenodo.20358654
+url: "https://github.com/JakeWiniski/Sample-Size-Optimization-for-Spatial-Material-Measurements"
+date-released: 2026-05-23
+version: "0.1.0"
+license: "Apache-2.0"
+abstract: >-
+  Initial proof-of-concept release of a workflow for estimating the
+  minimum number of spatial measurements required to characterize
+  specimen-level material properties with acceptable confidence.
+  The approach uses oversampled specimens, repeated subsampling,
+  and bootstrap-based stability analysis to quantify how measurement
+  density influences estimation accuracy.
+keywords:
+  - sample size optimization
+  - spatial measurements
+  - bootstrap
+  - subsampling
+  - materials science
+  - experimental design
+  - measurement design
+  - quality control
+  - biomaterials
+  - statistical learning
+repository-code: "https://github.com/JakeWiniski/Sample-Size-Optimization-for-Spatial-Material-Measurements"
+type: software
