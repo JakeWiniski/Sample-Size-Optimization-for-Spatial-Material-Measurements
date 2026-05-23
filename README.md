@@ -1,4 +1,5 @@
 # Subsampling Stability & Sample Size Optimization for Spatial Material Measurements
+[![DOI](https://zenodo.org/badge/1089168157.svg)](https://doi.org/10.5281/zenodo.20358653)
 
 ## Summary
 
